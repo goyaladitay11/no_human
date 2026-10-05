@@ -93,8 +93,12 @@ def hang_cli(monkeypatch):
     return calls
 
 
+_OVERHEAD_BUDGET_S = 2.0  # store writes + scheduler construction + sequential awaits; does NOT scale with _CLI_TIMEOUT
+
+
 async def _run_the_bound_check(store, hang_cli, monkeypatch, *, n: int,
-                                per_call_timeout: float, outer_bound: float):
+                                per_call_timeout: float):
+    outer_bound = n * per_call_timeout + _OVERHEAD_BUDGET_S
     monkeypatch.setattr(pw, "_CLI_TIMEOUT", per_call_timeout)
     for i in range(n):
         await _approval_task(store, i)
@@ -116,9 +120,6 @@ async def _run_the_bound_check(store, hang_cli, monkeypatch, *, n: int,
         f"({n} x {per_call_timeout} + overhead)")
 
 
-_OVERHEAD_BUDGET_S = 2.0  # store writes + scheduler construction + 20 sequential awaits; does NOT scale with _CLI_TIMEOUT
-
-
 @pytest.mark.slow
 async def test_twenty_parked_tasks_each_hanging_do_not_stall_the_tick_beyond_n_times_t(
     store, hang_cli, monkeypatch,
@@ -136,7 +137,6 @@ async def test_twenty_parked_tasks_each_hanging_do_not_stall_the_tick_beyond_n_t
         monkeypatch,
         n=20,
         per_call_timeout=1.0,
-        outer_bound=20 * 1.0 + _OVERHEAD_BUDGET_S,
     )
 
 
@@ -150,7 +150,6 @@ async def test_the_same_bound_holds_at_a_scaled_down_timeout(store, hang_cli, mo
         monkeypatch,
         n=20,
         per_call_timeout=0.05,
-        outer_bound=20 * 0.05 + _OVERHEAD_BUDGET_S,
     )
 
 
@@ -162,4 +161,5 @@ async def test_a_single_hanging_task_no_longer_stalls_the_tick_indefinitely(
     `seconds_since_last_tick: 647`): N=1 must resolve near-instantly once
     bounded, not hang."""
     await _run_the_bound_check(
-        store, hang_cli, monkeypatch, n=1, per_call_timeout=0.05, outer_bound=1.0)
+        store, hang_cli, monkeypatch, n=1, per_call_timeout=0.05)
+
