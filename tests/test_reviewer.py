@@ -1383,6 +1383,170 @@ async def test_broken_linked_repo_change_fails_review(linked_pair):
     assert not d.demoted_citations  # linked citation recognized, not demoted
 
 
+def _repo_with_big_linked_change(tmp_path):
+    """A linked repo whose single change is large enough to be CUT by a small
+    `_DIFF_CAP`, so its patch is truncated in the review section (#602)."""
+    r = tmp_path / "biglinked"
+    r.mkdir()
+    _git(r, "init", "-q")
+    _git(r, "config", "user.email", "t@t.t")
+    _git(r, "config", "user.name", "t")
+    (r / "service.py").write_text("def svc():\n    return 0\n")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "base")
+    padding = "\n".join(f"# pad line {i}" for i in range(400))
+    (r / "service.py").write_text(f"def svc():\n    return 0\n\n{padding}\n")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "big change")
+    return r
+
+
+def test_a_truncated_linked_repo_patch_is_recorded_as_required(tmp_path, monkeypatch):
+    """#602: a linked repo whose patch is CUT by the per-file budget records
+    that path — as an ABSOLUTE path under the linked repo, so the inspection
+    guard covers it and a rejection names which repo was not read. Before the
+    fix the third ``_git_diff`` value was dropped and the list was empty."""
+    import no_human.review.reviewer as rv
+    from no_human.review.reviewer import _linked_repos_review_section
+    monkeypatch.setattr(rv, "_DIFF_CAP", 1500)
+    linked = _repo_with_big_linked_change(tmp_path)
+    section, cut = _linked_repos_review_section([(linked, "HEAD~1")])
+    assert "TRUNCATED" in section
+    assert cut == [(linked / "service.py").as_posix()]
+    assert cut[0].startswith(linked.as_posix())  # names which repo
+
+
+async def test_a_truncated_linked_repo_unreferenced_verdict_is_rejected(
+        linked_pair, tmp_path, monkeypatch):
+    """A PASS reached without opening the cut LINKED file is discarded and the
+    task escalates — the same fail-closed path a cut PRIMARY file takes. Fails
+    on main, where the linked cut paths are dropped and the PASS stands."""
+    import no_human.review.reviewer as rv
+    from no_human.review.reviewer import ReviewerUnavailable
+    monkeypatch.setattr(rv, "_DIFF_CAP", 1500)
+    primary = linked_pair[0]
+    linked = _repo_with_big_linked_change(tmp_path)
+
+    class PassWithoutReading:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                      on_event=None, supervisor_hook=None):
+            out = _block(True, [{"label": "ok", "passed": True,
+                                 "evidence": "app.py:1", "severity": "low"}])
+            return AgentResult(final_text=out, num_turns=1, is_error=False,
+                               tokens_used=10, session_id="f",
+                               stop_reason="end_turn")
+
+    reviewer = AdversarialReviewer(backend=PassWithoutReading(), timeout=1)
+    t = Task.new("multi-repo change", repo_path=str(primary))
+    t.linked_repos = [str(linked)]
+    with pytest.raises(ReviewerUnavailable):
+        await reviewer.review(
+            t, repo_path=primary, before_ref="HEAD~1",
+            linked_repos=[(linked, "HEAD~1")],
+        )
+
+
+async def test_a_truncated_linked_repo_referenced_verdict_stands(
+        linked_pair, tmp_path, monkeypatch):
+    """Control: once the reviewer opens the cut linked file by its absolute
+    path, the same verdict is accepted — the guard is about coverage, not an
+    unconditional block on truncated linked repos."""
+    import no_human.review.reviewer as rv
+    monkeypatch.setattr(rv, "_DIFF_CAP", 1500)
+    primary = linked_pair[0]
+    linked = _repo_with_big_linked_change(tmp_path)
+    abs_path = (linked / "service.py").as_posix()
+
+    class PassAfterReading:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                      on_event=None, supervisor_hook=None):
+            if on_event is not None:
+                on_event(AgentEvent("tool_use", tool_name="Read",
+                                    tool_input={"file_path": abs_path}))
+            out = _block(True, [{"label": "ok", "passed": True,
+                                 "evidence": "app.py:1", "severity": "low"}])
+            return AgentResult(final_text=out, num_turns=1, is_error=False,
+                               tokens_used=10, session_id="f",
+                               stop_reason="end_turn")
+
+    reviewer = AdversarialReviewer(backend=PassAfterReading(), timeout=1)
+    t = Task.new("multi-repo change", repo_path=str(primary))
+    t.linked_repos = [str(linked)]
+    d = await reviewer.review(
+        t, repo_path=primary, before_ref="HEAD~1",
+        linked_repos=[(linked, "HEAD~1")],
+    )
+    assert d.passed is True
+
+
+async def test_a_truncated_linked_repo_overrides_single_turn_routing(
+        linked_pair, tmp_path, monkeypatch):
+    """Even when routing asked for a single-turn review (small primary diff), a
+    truncated linked patch forces the multi-turn, tool-enabled path so the cut
+    file can be inspected — and an unreferenced verdict is still rejected. The
+    single-turn path has no tools and is passed no ``required_inspections``, so
+    without this a small-primary task would review a truncated linked repo
+    blind."""
+    import no_human.review.reviewer as rv
+    from no_human.review.reviewer import ReviewerUnavailable
+    monkeypatch.setattr(rv, "_DIFF_CAP", 1500)
+    primary = linked_pair[0]
+    linked = _repo_with_big_linked_change(tmp_path)
+
+    class PassWithoutReading:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                      on_event=None, supervisor_hook=None):
+            out = _block(True, [{"label": "ok", "passed": True,
+                                 "evidence": "app.py:1", "severity": "low"}])
+            return AgentResult(final_text=out, num_turns=1, is_error=False,
+                               tokens_used=10, session_id="f",
+                               stop_reason="end_turn")
+
+    reviewer = AdversarialReviewer(backend=PassWithoutReading(), timeout=1)
+    t = Task.new("multi-repo change", repo_path=str(primary))
+    t.linked_repos = [str(linked)]
+    with pytest.raises(ReviewerUnavailable):
+        await reviewer.review(
+            t, repo_path=primary, before_ref="HEAD~1",
+            linked_repos=[(linked, "HEAD~1")], single_turn=True,
+        )
+
+
+@pytest.mark.parametrize("repo_dir", [
+    "/work/linked/acme-lib",       # plain
+    "/work/linked/My Lib",         # a space
+    "/work/linked/acme (copy)",    # parentheses
+    "C:/Users/u/acme-lib",         # a drive-letter colon (Windows clone)
+])
+def test_an_absolute_linked_cut_path_is_credited_when_read(repo_dir):
+    """#602 review (eyalgolan): a linked repo lives wherever it was cloned, so
+    its registered absolute path can carry a space, parenthesis, or drive-letter
+    colon — none kept by `_PATH_TOKEN`. Reading the EXACT file must still credit
+    it (the guard is coverage, not a wall nobody can pass), and the rejection
+    names which repo. Runs on every platform, so it also covers the Windows
+    behaviour #504 keeps out of CI."""
+    from no_human.review.diff_coverage import InspectionTracker
+    abs_path = f"{repo_dir}/lib/math.js"
+    tracker = InspectionTracker([abs_path])
+    assert tracker.unreferenced() == [abs_path]
+    assert repo_dir.rsplit("/", 1)[-1] in tracker.rejection()  # names the repo
+    tracker.note_event(AgentEvent("tool_use", tool_name="Read",
+                                  tool_input={"file_path": abs_path}))
+    assert tracker.rejection() == ""
+
+
+def test_a_windows_spelled_read_credits_the_posix_required_path():
+    """A reviewer on Windows reads with backslashes; the path is stored POSIX
+    (`as_posix`). `note_event` normalizes backslashes, so the exact read still
+    credits it. Runs on every platform (#602 review)."""
+    from no_human.review.diff_coverage import InspectionTracker
+    tracker = InspectionTracker(["C:/Users/u/acme-lib/lib/math.js"])
+    tracker.note_event(AgentEvent(
+        "tool_use", tool_name="Read",
+        tool_input={"file_path": r"C:\Users\u\acme-lib\lib\math.js"}))
+    assert tracker.rejection() == ""
+
+
 def test_linked_repo_citation_demoted_only_without_the_linked_repo(linked_pair):
     """Control proving the fix matters: the same critical finding that cites a
     linked-repo file is DEMOTED when the reviewer sees only the primary repo,
@@ -1429,9 +1593,10 @@ def test_linked_section_notes_a_repo_with_no_changes(linked_pair):
     empty linked list yields the empty string (single-repo byte-identical)."""
     from no_human.review.reviewer import _linked_repos_review_section
     primary, _linked = linked_pair
-    section = _linked_repos_review_section([(primary, "HEAD")])  # HEAD..HEAD = no diff
+    section, cut = _linked_repos_review_section([(primary, "HEAD")])  # HEAD..HEAD
     assert "NO CHANGES in this repo" in section
-    assert _linked_repos_review_section([]) == ""
+    assert cut == []  # nothing changed, nothing to require
+    assert _linked_repos_review_section([]) == ("", [])
 
 
 # --------------------------------------------------------------------------- #

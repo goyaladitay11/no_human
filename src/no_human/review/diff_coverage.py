@@ -264,12 +264,17 @@ class InspectionTracker:
     hand-written root `RELEASE_MANIFEST.txt` is exempted too, since this layer
     does not know which repository it reviews.
 
-    Scope, so the gap is recorded rather than discovered: only the PRIMARY
-    diff's cut paths are tracked. `_linked_repos_review_section` drops the cut
-    paths of a linked repo (the `_cut_paths` it names and does not use), so a
-    truncated linked-repo patch can still reach a verdict unread. That is the
-    same failure in a narrower place than the one this closes, and widening
-    the check belongs with whoever gives linked repos coverage that matters.
+    Scope: a linked repo's cut paths are tracked too (#602).
+    `_linked_repos_review_section` now returns them, and `review()` adds them to
+    `required_inspections` alongside the primary diff's — as ABSOLUTE paths, so
+    they never collide with the primary's relative paths and the rejection names
+    which repo was not read. A truncated linked-repo patch is therefore covered
+    by the same guard the primary diff has, closing the narrower case this used
+    to carry. An absolute required path is credited when the reviewer reads it:
+    `note_event` matches each whole tool-input string leaf (backslashes
+    normalized) against the required paths as well as the `_PATH_TOKEN` tokens,
+    so a path containing a space, parenthesis, or drive-letter colon — which
+    the tokenizer would split — is still credited by a `Read` of the exact file.
     """
 
     def __init__(self, required: Iterable[str] | None = None) -> None:
@@ -302,6 +307,7 @@ class InspectionTracker:
                     or any(_names_path(name, path) for name in names))
             return
         tokens: list[str] = []
+        leaves: list[str] = []
         stack = [getattr(event, "tool_input", None) or {}]
         while stack:
             value = stack.pop()
@@ -310,10 +316,23 @@ class InspectionTracker:
             elif isinstance(value, (list, tuple, set)):
                 stack.extend(value)
             elif isinstance(value, str):
+                leaves.append(value)
                 tokens.extend(_path_tokens(value))
         for token in tokens:
             self._seen.update(
                 path for path in self._required if _names_path(token, path))
+        # And each WHOLE string leaf, against the same rule. A required path
+        # may be absolute (a linked repo lives wherever it was cloned), and an
+        # absolute path can carry a space, a parenthesis, or a drive-letter
+        # colon — none kept by `_PATH_TOKEN` — so tokenizing alone can never
+        # credit a `Read` of the exact file at such a location, and the guard
+        # would be one no reviewer could pass. Backslashes are normalized so a
+        # Windows spelling matches the stored POSIX path. A free-form leaf that
+        # is not itself a path simply matches nothing here.
+        for leaf in leaves:
+            normalized = leaf.replace("\\", "/")
+            self._seen.update(
+                path for path in self._required if _names_path(normalized, path))
         listed = {
             path for path in self._required - self._seen if "/" in path
             and any(_names_path(token.rstrip("/"), path.rsplit("/", 1)[0])
